@@ -1,63 +1,107 @@
+# Finaler Bot-Code mit Live-Trading-Signalen, /test, /ausblick, Abend-Scan
+# Anforderungen: Python 3.10+, "python-telegram-bot", "yfinance", "schedule", "pandas"
 
-import os
-import time
-import requests
+import logging
 import yfinance as yf
+import datetime
 import pandas as pd
-import numpy as np
+import schedule
+import time
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# === CONFIG ===
+TOKEN = "7875344663:AAGj8IRtHVZtzI1KFwfNcBHfbG5YTy15pcs"
+CHAT_ID = "1374880672"
+ASSETS = ["BTC-USD", "ETH-USD", "^NDX", "^GSPC", "GC=F", "AAPL", "TSLA", "PLTR"]
 
-def send_signal(message):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    requests.post(url, data=payload)
+# === LOGGING ===
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-def get_data(symbol="^IXIC", interval="1h", period="2d"):
-    data = yf.download(tickers=symbol, interval=interval, period=period)
-    return data
+# === STRATEGIE ===
+def check_signals():
+    messages = []
+    for symbol in ASSETS:
+        data = yf.download(symbol, period="5d", interval="30m")
+        if len(data) < 14:
+            continue
 
-def calculate_rsi(data, period=14):
-    delta = data['Close'].diff()
+        rsi = compute_rsi(data["Close"], 14)
+        last_close = data["Close"].iloc[-1]
+        volume_spike = data["Volume"].iloc[-1] > data["Volume"].rolling(10).mean().iloc[-1] * 2
+
+        # Candle-Erkennung
+        candles = data.iloc[-2:]
+        candle_pattern = ""
+        if candles["Close"].iloc[-1] > candles["Open"].iloc[-1] and candles["Open"].iloc[-1] < candles["Close"].iloc[-2]:
+            candle_pattern = "Bullish Engulfing"
+
+        if rsi < 30 or candle_pattern or volume_spike:
+            msg = f"\n📊 Signal: {symbol}\n"
+            msg += f"📈 Kurs: {last_close:.2f}\n"
+            msg += f"📉 RSI: {rsi:.2f}\n"
+            if candle_pattern:
+                msg += f"🕯️ Pattern: {candle_pattern}\n"
+            if volume_spike:
+                msg += "🔥 Volumenanstieg erkannt\n"
+            msg += f"🔁 Plattform: Trade Republic oder Trading 212\n"
+            messages.append(msg)
+    return messages
+
+# === RSI BERECHNUNG ===
+def compute_rsi(series, period=14):
+    delta = series.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     avg_gain = gain.rolling(window=period).mean()
     avg_loss = loss.rolling(window=period).mean()
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return rsi.iloc[-1]
 
-def detect_chart_signal():
-    data = get_data()
-    if data is None or len(data) < 20:
-        return None
+# === HANDLER ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Willkommen! Nutze /test oder /ausblick für Signale.")
 
-    data['RSI'] = calculate_rsi(data)
-    data['Trend'] = data['Close'].diff().rolling(window=3).mean()
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📊 TESTSIGNAL: Palantir (PLTR)\n🟢 LONG empfohlen\nEinstieg: 19,40 $ | TP: 21,00 $ | SL: 18,60 $\n(Kein echtes Signal – Funktionstest)"
+    )
 
-    latest = data.iloc[-1]
-    price = round(latest['Close'], 2)
-    rsi = latest['RSI']
-    trend = latest['Trend']
+async def ausblick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    messages = check_signals()
+    if messages:
+        for msg in messages:
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+    else:
+        await context.bot.send_message(chat_id=CHAT_ID, text="📭 Keine guten Chancen gefunden.")
 
-    if rsi < 30 and trend > 0:
-        return f"📊 <b>Signal: NASDAQ</b>\n🟢 <b>LONG empfohlen</b>\nEinstieg: {price}\nSL: {round(price * 0.985, 2)}\nTP: {round(price * 1.02, 2)}\n🔁 Plattform: Trading212"
-    elif rsi > 70 and trend < 0:
-        return f"📊 <b>Signal: NASDAQ</b>\n🔴 <b>SHORT empfohlen</b>\nEinstieg: {price}\nSL: {round(price * 1.015, 2)}\nTP: {round(price * 0.97, 2)}\n🔁 Plattform: Trade Republic"
-    return None
+# === TÄGLICHER ABEND-SCAN ===
+def abend_scan():
+    app = ApplicationBuilder().token(TOKEN).build()
+    messages = check_signals()
+    for msg in messages:
+        app.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-last_signal = ""
-while True:
-    try:
-        signal = detect_chart_signal()
-        if signal and signal != last_signal:
-            send_signal(signal)
-            last_signal = signal
-    except Exception as e:
-        print(f"Fehler: {e}")
-    time.sleep(300)  # alle 5 Minuten prüfen
+# === BOT STARTEN ===
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("test", test))
+app.add_handler(CommandHandler("ausblick", ausblick))
+
+# === GEPLANTER ABEND-SCAN ===
+schedule.every().day.at("20:00").do(abend_scan)
+
+async def main_loop():
+    while True:
+        schedule.run_pending()
+        await asyncio.sleep(30)
+
+if __name__ == '__main__':
+    import asyncio
+    app.run_polling()
+    asyncio.run(main_loop())
+
